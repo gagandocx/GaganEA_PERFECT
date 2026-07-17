@@ -167,10 +167,11 @@ int rsi_handle, macd_handle, adx_handle, vol_handle;
 int reversal_buy_signals, reversal_sell_signals;
 
 string lbl = "GEA_";
-int totalBuys, totalSells;
+int open_buy_count, open_sell_count;
 double buyAvgPrice, sellAvgPrice;
 double buyTotalLots, sellTotalLots;
 double buyProfitPips, sellProfitPips;
+double floating_pnl;
 double basketBuyHigh, basketSellHigh;
 double basketBuyTrail, basketSellTrail;
 bool   basketBuyActive, basketSellActive;
@@ -190,8 +191,21 @@ ulong  t1_tickets[];
 ulong  t2_tickets[];
 
 // PnL cache
-datetime pnlCacheTime;
-double pnlToday, pnlYesterday, pnlWeek, pnlMonth;
+datetime pnl_cache_time;
+double pnl_today, pnl_yesterday, pnl_week, pnl_month, pnl_last_month;
+
+// Trend state
+bool   htf_bullish, htf_bearish;
+bool   ctf_above_ema, ctf_below_ema;
+double ema_distance_pips;
+string current_signal;
+color  signal_color;
+double pip, point_size;
+
+// News and time
+bool     news_active;
+datetime last_bar_time;
+datetime last_m1_bar_time;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -244,6 +258,25 @@ int OnInit()
    reversal_buy_signals = 0;
    reversal_sell_signals = 0;
    
+   // Initialize pip/point
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   point_size = _Point;
+   pip = (digits == 3 || digits == 5) ? point_size * 10 : point_size;
+   
+   // Initialize state
+   htf_bullish = false;
+   htf_bearish = false;
+   ctf_above_ema = false;
+   ctf_below_ema = false;
+   ema_distance_pips = 0;
+   current_signal = "---";
+   signal_color = clrGray;
+   floating_pnl = 0;
+   news_active = false;
+   last_bar_time = 0;
+   last_m1_bar_time = 0;
+   pnl_last_month = 0;
+   
    if(Show_Dashboard) CreateDashboard();
    
    Print("GaganEA v2.10 initialized on ", _Symbol, " TF:", EnumToString(Trade_Timeframe));
@@ -279,6 +312,43 @@ void OnTick()
    // Refresh position data
    CountOpenPositions();
    
+   // Compute floating P/L
+   floating_pnl = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != Magic_Number || posInfo.Symbol() != _Symbol) continue;
+      floating_pnl += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   }
+   
+   // Update trend state for dashboard
+   double emaHTF_tick[], emaCTF_tick[];
+   ArraySetAsSeries(emaHTF_tick, true);
+   ArraySetAsSeries(emaCTF_tick, true);
+   if(CopyBuffer(ema_htf_handle, 0, 0, 1, emaHTF_tick) >= 1)
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      htf_bullish = (bid > emaHTF_tick[0]);
+      htf_bearish = (bid < emaHTF_tick[0]);
+   }
+   if(CopyBuffer(ema_ctf_handle, 0, 0, 1, emaCTF_tick) >= 1)
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      ctf_above_ema = (bid > emaCTF_tick[0]);
+      ctf_below_ema = (bid < emaCTF_tick[0]);
+      ema_distance_pips = MathAbs(bid - emaCTF_tick[0]) / pip;
+   }
+   
+   // Update signal state
+   int bp = DetectBullishPattern();
+   int sp = DetectBearishPattern();
+   if(bp > 0) { current_signal = "BUY #" + IntegerToString(bp); signal_color = clrLime; }
+   else if(sp > 0) { current_signal = "SELL #" + IntegerToString(sp); signal_color = clrTomato; }
+   else { current_signal = "Scanning..."; signal_color = clrGray; }
+   
+   // News state
+   news_active = ((News_Filter_Enable || News_FilterEnable) && IsNewsTime());
+   
    // Equity Protection
    if(CheckEquityProtection()) return;
    
@@ -307,6 +377,7 @@ void OnTick()
    datetime curBar = iTime(_Symbol, Trade_Timeframe, 0);
    if(curBar == lastBar) { if(Show_Dashboard) UpdateDashboard(); return; }
    lastBar = curBar;
+   last_bar_time = curBar;
    
    // Spread filter
    if(Max_Spread_Pips > 0)
@@ -316,7 +387,7 @@ void OnTick()
    }
    
    // News filter
-   if((News_Filter_Enable || News_FilterEnable) && IsNewsTime())
+   if(news_active)
    { if(Show_Dashboard) UpdateDashboard(); return; }
    
    // Entry logic
@@ -410,7 +481,7 @@ double NormalizeLot(double lots)
 //+------------------------------------------------------------------+
 void CountOpenPositions()
 {
-   totalBuys = 0; totalSells = 0;
+   open_buy_count = 0; open_sell_count = 0;
    buyAvgPrice = 0; sellAvgPrice = 0;
    buyTotalLots = 0; sellTotalLots = 0;
    buyProfitPips = 0; sellProfitPips = 0;
@@ -425,14 +496,14 @@ void CountOpenPositions()
       
       if(posInfo.PositionType() == POSITION_TYPE_BUY)
       {
-         totalBuys++;
+         open_buy_count++;
          buyAvgPrice += op * lt;
          buyTotalLots += lt;
          buyProfitPips += (SymbolInfoDouble(_Symbol, SYMBOL_BID) - op) / _Point;
       }
       else
       {
-         totalSells++;
+         open_sell_count++;
          sellAvgPrice += op * lt;
          sellTotalLots += lt;
          sellProfitPips += (op - SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / _Point;
@@ -571,7 +642,7 @@ void ManageIndividualTrailing()
 void ManageBasketTrailing()
 {
    // Buy basket
-   if(totalBuys > 0)
+   if(open_buy_count > 0)
    {
       if(!basketBuyActive && buyProfitPips >= Basket_Lock_Pips)
       {
@@ -596,7 +667,7 @@ void ManageBasketTrailing()
    else { basketBuyActive = false; basketBuyHigh = 0; basketBuyTrail = 0; }
    
    // Sell basket
-   if(totalSells > 0)
+   if(open_sell_count > 0)
    {
       if(!basketSellActive && sellProfitPips >= Basket_Lock_Pips)
       {
@@ -626,7 +697,7 @@ void ManageBasketTrailing()
 //+------------------------------------------------------------------+
 void ManageAMAExit()
 {
-   if(totalBuys == 0 && totalSells == 0) return;
+   if(open_buy_count == 0 && open_sell_count == 0) return;
    
    double ama[];
    ArraySetAsSeries(ama, true);
@@ -637,7 +708,7 @@ void ManageAMAExit()
    if(CopyClose(_Symbol, PERIOD_M1, 0, AMA_Confirm_Candles+1, close) < AMA_Confirm_Candles+1) return;
    
    // Bearish flip - close buys
-   if(totalBuys > 0)
+   if(open_buy_count > 0)
    {
       int cnt = 0;
       for(int c = 1; c <= AMA_Confirm_Candles; c++)
@@ -651,7 +722,7 @@ void ManageAMAExit()
    }
    
    // Bullish flip - close sells
-   if(totalSells > 0)
+   if(open_sell_count > 0)
    {
       int cnt = 0;
       for(int c = 1; c <= AMA_Confirm_Candles; c++)
@@ -678,7 +749,7 @@ void ManageAMAExit()
 //+------------------------------------------------------------------+
 void ManageReversalExit()
 {
-   if(totalBuys == 0 && totalSells == 0) { reversal_buy_signals = 0; reversal_sell_signals = 0; return; }
+   if(open_buy_count == 0 && open_sell_count == 0) { reversal_buy_signals = 0; reversal_sell_signals = 0; return; }
    
    // Get RSI
    double rsi[];
@@ -715,7 +786,7 @@ void ManageReversalExit()
    if(CopyBuffer(ema_ctf_handle, 0, 0, 5, ema) < 5) return;
    
    // --- BEARISH reversal (exit buys) ---
-   if(totalBuys > 0)
+   if(open_buy_count > 0)
    {
       int sig = 0;
       // 1. RSI Divergence
@@ -740,7 +811,7 @@ void ManageReversalExit()
    else reversal_buy_signals = 0;
    
    // --- BULLISH reversal (exit sells) ---
-   if(totalSells > 0)
+   if(open_sell_count > 0)
    {
       int sig = 0;
       // 1. RSI Divergence
@@ -885,10 +956,10 @@ void CheckMasterEquityProtection()
    double dd = ((bal - eq) / bal) * 100.0;
    
    bool trigger = (dd >= Master_Trigger_DD_Percent) || 
-                  (totalBuys + totalSells >= Master_Trigger_Min_Trades);
+                  (open_buy_count + open_sell_count >= Master_Trigger_Min_Trades);
    
    // Buy side
-   if(totalBuys > 0 && trigger)
+   if(open_buy_count > 0 && trigger)
    {
       if(!masterBuyActive && buyProfitPips >= Master_Lock_Pips)
       {
@@ -913,7 +984,7 @@ void CheckMasterEquityProtection()
    else masterBuyActive = false;
    
    // Sell side
-   if(totalSells > 0 && trigger)
+   if(open_sell_count > 0 && trigger)
    {
       if(!masterSellActive && sellProfitPips >= Master_Lock_Pips)
       {
@@ -1265,136 +1336,154 @@ double GetPeriodPnL(datetime from, datetime to)
 void RefreshPnLCache()
 {
    datetime now = TimeCurrent();
-   if(now - pnlCacheTime < 60) return;
-   pnlCacheTime = now;
+   if(now - pnl_cache_time < 60) return;
+   pnl_cache_time = now;
    
    MqlDateTime dt;
    TimeToStruct(now, dt);
    
    // Today
    datetime todayStart = now - dt.hour*3600 - dt.min*60 - dt.sec;
-   pnlToday = GetPeriodPnL(todayStart, now);
+   pnl_today = GetPeriodPnL(todayStart, now);
    
    // Yesterday
    datetime yestStart = todayStart - 86400;
-   pnlYesterday = GetPeriodPnL(yestStart, todayStart);
+   pnl_yesterday = GetPeriodPnL(yestStart, todayStart);
    
    // This week (Monday start)
    int dow = dt.day_of_week;
    if(dow == 0) dow = 7;
    datetime weekStart = todayStart - (dow-1)*86400;
-   pnlWeek = GetPeriodPnL(weekStart, now);
+   pnl_week = GetPeriodPnL(weekStart, now);
    
    // This month
    datetime monthStart = todayStart - (dt.day-1)*86400;
-   pnlMonth = GetPeriodPnL(monthStart, now);
+   pnl_month = GetPeriodPnL(monthStart, now);
+   
+   // Last month
+   datetime lastMonthEnd = monthStart;
+   datetime lastMonthStart = lastMonthEnd - 30*86400;  // approximate
+   MqlDateTime lmDt;
+   TimeToStruct(lastMonthEnd - 86400, lmDt);
+   lastMonthStart = lastMonthEnd - lmDt.day * 86400;
+   pnl_last_month = GetPeriodPnL(lastMonthStart, lastMonthEnd);
 }
 
 //+------------------------------------------------------------------+
-//| CREATE DASHBOARD - Original dark blue-grey panel style            |
+//| CREATE DASHBOARD                                                  |
 //+------------------------------------------------------------------+
 void CreateDashboard()
 {
-   int x = Dashboard_X + 10;
-   int vx = x + 100;
-   int y = Dashboard_Y + 5;
-   int row = 15;
-   int lfs = 8;
-   color lbl_col = C'180,180,200';
-   color val_col = clrWhite;
-   color title_col = clrOrange;
-   int r = y;
+   DeleteDashboard();
+   int x = Dashboard_X, y = Dashboard_Y;
+
+   // --- Colours matching OFT TrendTrading style ---
+   color bg_col     = C'22,30,45';    // dark blue-grey panel
+   color border_col = C'45,55,90';    // medium blue border
+   color lbl_col    = clrSilver;
+   color val_col    = clrWhite;
+   int   lfs        = 8;              // label font size
+   int   vx         = x + 100;        // value column X
+   int   row        = 14;             // row height
+
+   // Background — taller to fit all rows
+   ObjRect(lbl+"bg", x-8, y-8, 325, 460, bg_col, border_col, 1);
+
+   // Title row — orange square bullet like OFT
+   ObjLabel(lbl+"bullet", "\x25A0", x, y+2, C'255,140,0', 10, true);
+   ObjLabel(lbl+"title",  " GaganEA v2.10", x+12, y+2, clrWhite, 9, true);
+   ObjLine(lbl+"d0", x, y+18, 305);
    
-   // Background
-   ObjRect(lbl+"bg", Dashboard_X, Dashboard_Y, 325, 460, C'22,30,45', C'45,55,90');
+   // --- Symbol / TF block ---
+   int r = y+28;
+   ObjLabel(lbl+"l_sym",  "Symbol",   x,  r,        lbl_col, lfs);
+   ObjLabel(lbl+"v_sym",  _Symbol,    vx, r,        val_col, lfs);
+   ObjLabel(lbl+"l_ttf",  "Trade TF", x,  r+row,    lbl_col, lfs);
+   ObjLabel(lbl+"v_ttf",  TFStr(Trade_Timeframe), vx, r+row, val_col, lfs);
+   ObjLabel(lbl+"l_htf",  "HTF",      x,  r+row*2,  lbl_col, lfs);
+   ObjLabel(lbl+"v_htf",  TFStr(HTF_Timeframe),   vx, r+row*2, val_col, lfs);
+   ObjLine(lbl+"d1", x, r+row*3+2, 305);
+
+   // --- Trend / Signal block ---
+   r = y+28 + row*3 + 12;
+   ObjLabel(lbl+"l_trend","HTF Trend",  x,  r,        lbl_col, lfs);
+   ObjLabel(lbl+"v_trend","---",        vx, r,        val_col, lfs);
+   ObjLabel(lbl+"l_ctf",  "CTF EMA",   x,  r+row,    lbl_col, lfs);
+   ObjLabel(lbl+"v_ctf",  "---",       vx, r+row,    val_col, lfs);
+   ObjLabel(lbl+"l_dist", "Distance",  x,  r+row*2,  lbl_col, lfs);
+   ObjLabel(lbl+"v_dist", "---",       vx, r+row*2,  val_col, lfs);
+   ObjLabel(lbl+"l_sig",  "Signal",    x,  r+row*3,  lbl_col, lfs);
+   ObjLabel(lbl+"v_sig",  "---",       vx, r+row*3,  val_col, lfs);
+   ObjLabel(lbl+"l_sprd", "Spread",    x,  r+row*4,  lbl_col, lfs);
+   ObjLabel(lbl+"v_sprd", "---",       vx, r+row*4,  val_col, lfs);
+   ObjLine(lbl+"d2", x, r+row*5+2, 305);
    
-   // Title
-   ObjLabel(lbl+"title", "\x25A0 GaganEA v2.10", x, r, title_col, 9);
-   r += row + 6;
-   ObjLine(lbl+"d1", x, r, 305);
-   r += 8;
+   // --- Trade block ---
+   r = r + row*5 + 12;
+   ObjLabel(lbl+"l_open", "Open Trades",  x,  r,        lbl_col, lfs);
+   ObjLabel(lbl+"v_open", "0",            vx, r,        val_col, lfs);
+   ObjLabel(lbl+"l_lot",  "Lot Size",     x,  r+row,    lbl_col, lfs);
+   ObjLabel(lbl+"v_lot",  "---",          vx, r+row,    val_col, lfs);
+   ObjLabel(lbl+"l_fpnl", "Floating P/L", x,  r+row*2,  lbl_col, lfs);
+   ObjLabel(lbl+"v_fpnl", "---",          vx, r+row*2,  val_col, lfs);
+   ObjLine(lbl+"d3", x, r+row*3+2, 305);
+
+   // SL/T info + Lot Mode (single compact line each)
+   r = r + row*3 + 10;
+   ObjLabel(lbl+"l_slinfo", StringFormat("SL: %d  |  T1:%d  |  T2:%d  |  T3:%d",
+            StopLoss_Pips, T1_Pips, T2_Pips, T3_Pips), x, r, lbl_col, lfs);
+   ObjLabel(lbl+"l_lm",  "Lot Mode",  x,   r+row,  lbl_col, lfs);
+   ObjLabel(lbl+"v_lm",  Manual_LotSize > 0
+            ? StringFormat("Manual %.2f", Manual_LotSize)
+            : StringFormat("Auto %.1f%%", Risk_Percent), vx, r+row, val_col, lfs);
+   ObjLine(lbl+"d4", x, r+row*2+4, 305);
    
-   // Symbol / TF
-   ObjLabel(lbl+"l_sym",  "Symbol",    x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_sym",  _Symbol,     vx, r,     val_col, lfs);
-   ObjLabel(lbl+"l_tf",   "Timeframe", x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_tf",   TFStr(Trade_Timeframe), vx, r+row, val_col, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d2", x, r, 305);
-   r += 8;
+   // --- P&L block (paired like OFT: Today | Yest on same line) ---
+   r = r + row*2 + 14;
+   ObjLabel(lbl+"l_today", "Today :",    x,       r,       lbl_col, lfs);
+   ObjLabel(lbl+"v_today", "---",        x+55,    r,       val_col, lfs);
+   ObjLabel(lbl+"l_yest",  "| Yest :",   x+150,   r,       lbl_col, lfs);
+   ObjLabel(lbl+"v_yest",  "---",        x+210,   r,       val_col, lfs);
+
+   ObjLabel(lbl+"l_week",  "This Week :",x,       r+row,   lbl_col, lfs);
+   ObjLabel(lbl+"v_week",  "---",        x+75,    r+row,   val_col, lfs);
+   ObjLabel(lbl+"l_mo",    "| This Mo :",x+150,   r+row,   lbl_col, lfs);
+   ObjLabel(lbl+"v_mo",    "---",        x+215,   r+row,   val_col, lfs);
+
+   ObjLabel(lbl+"l_lmo",   "Last Month :",x,      r+row*2, lbl_col, lfs);
+   ObjLabel(lbl+"v_lmo",   "---",         x+80,   r+row*2, val_col, lfs);
+   ObjLine(lbl+"d5", x, r+row*3+2, 305);
    
-   // Trend / Signal
-   ObjLabel(lbl+"l_trend","HTF Trend", x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_trend","---",       vx, r,     val_col, lfs);
-   ObjLabel(lbl+"l_sig",  "Signal",    x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_sig",  "---",       vx, r+row, val_col, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d3", x, r, 305);
-   r += 8;
+   // --- News + Last Bar block ---
+   r = r + row*3 + 12;
+   ObjLabel(lbl+"l_news", "News Filter",  x,  r,       lbl_col, lfs);
+   ObjLabel(lbl+"v_news", "OFF \xE2\x9C\x93", vx, r,  clrLime,  lfs);
+   ObjLabel(lbl+"l_bar",  "Last Bar",     x,  r+row,   lbl_col, lfs);
+   ObjLabel(lbl+"v_bar",  "---",          vx, r+row,   val_col, lfs);
+   ObjLine(lbl+"d6", x, r+row*2+4, 305);
+
+   // --- AMA Exit block (M1 trend-flip) ---
+   r = r + row*2 + 12;
+   ObjLabel(lbl+"l_ama",  "AMA Exit (M1)", x,  r,       lbl_col, lfs);
+   ObjLabel(lbl+"v_ama",  Use_AMA_Exit ? "ON" : "OFF",  vx, r,  Use_AMA_Exit ? clrLime : clrGray, lfs);
+   ObjLabel(lbl+"l_amast",   "Flip Status",  x,  r+row,   lbl_col, lfs);
+   ObjLabel(lbl+"v_amast",   "---",          vx, r+row,   val_col, lfs);
+   ObjLine(lbl+"d7", x, r+row*2+4, 305);
    
-   // Trade Info
-   ObjLabel(lbl+"l_buys", "Buys",      x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_buys", "0",         vx, r,     val_col, lfs);
-   ObjLabel(lbl+"l_sells","Sells",     x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_sells","0",         vx, r+row, val_col, lfs);
-   ObjLabel(lbl+"l_lots", "Lots",      x,  r+row*2, lbl_col, lfs);
-   ObjLabel(lbl+"v_lots", "0.00",      vx, r+row*2, val_col, lfs);
-   r += row*3 + 4;
-   ObjLine(lbl+"d4", x, r, 305);
-   r += 8;
-   
-   // SL / Targets
-   ObjLabel(lbl+"l_sl",   "StopLoss",  x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_sl",   Use_StopLoss ? IntegerToString(StopLoss_Pips)+"p" : "OFF", vx, r, Use_StopLoss ? clrRed : clrGray, lfs);
-   ObjLabel(lbl+"l_t1",   "T1/T2/T3",  x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_t1",   IntegerToString(T1_Pips)+"/"+IntegerToString(T2_Pips)+"/"+IntegerToString(T3_Pips), vx, r+row, clrLime, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d5", x, r, 305);
-   r += 8;
-   
-   // P&L
-   ObjLabel(lbl+"l_pnl1", "Today",     x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_pnl1", "$0.00",     vx, r,     val_col, lfs);
-   ObjLabel(lbl+"l_pnl1b","Yest",      vx+70, r,  lbl_col, lfs);
-   ObjLabel(lbl+"v_pnl1b","$0.00",     vx+100, r, val_col, lfs);
-   ObjLabel(lbl+"l_pnl2", "This Week", x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_pnl2", "$0.00",     vx, r+row, val_col, lfs);
-   ObjLabel(lbl+"l_pnl2b","This Mo",   vx+70, r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_pnl2b","$0.00",     vx+100, r+row, val_col, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d6", x, r, 305);
-   r += 8;
-   
-   // News
-   ObjLabel(lbl+"l_news", "News Filter", x, r,    lbl_col, lfs);
-   ObjLabel(lbl+"v_news", (News_Filter_Enable||News_FilterEnable) ? "ON" : "OFF", vx, r, (News_Filter_Enable||News_FilterEnable) ? clrYellow : clrGray, lfs);
-   r += row + 4;
-   ObjLine(lbl+"d7", x, r, 305);
-   r += 8;
-   
-   // AMA Exit
-   ObjLabel(lbl+"l_ama",  "AMA Exit",  x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_ama",  Use_AMA_Exit ? "ON" : "OFF", vx, r, Use_AMA_Exit ? clrLime : clrGray, lfs);
-   ObjLabel(lbl+"l_amast","AMA Status", x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_amast","---",        vx, r+row, val_col, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d7b", x, r, 305);
-   r += 8;
-   
-   // Reversal Detection
+   // --- Reversal Detection block (NEW - added for reversal exit) ---
+   r = r + row*2 + 12;
    ObjLabel(lbl+"l_rev",  "Reversal Exit", x,  r,       lbl_col, lfs);
    ObjLabel(lbl+"v_rev",  Use_Reversal_Exit ? "ON" : "OFF",  vx, r,  Use_Reversal_Exit ? clrLime : clrGray, lfs);
    ObjLabel(lbl+"l_revst",   "Rev Status",  x,  r+row,   lbl_col, lfs);
    ObjLabel(lbl+"v_revst",   "---",          vx, r+row,   val_col, lfs);
-   r += row*2 + 4;
-   ObjLine(lbl+"d8", x, r, 305);
-   r += 8;
-   
-   // Status
-   ObjLabel(lbl+"l_stat", "Status",    x,  r,     lbl_col, lfs);
-   ObjLabel(lbl+"v_stat", "Running",   vx, r,     clrLime, lfs);
-   ObjLabel(lbl+"l_time", "Time",      x,  r+row, lbl_col, lfs);
-   ObjLabel(lbl+"v_time", TimeToString(TimeCurrent(), TIME_MINUTES), vx, r+row, val_col, lfs);
+   ObjLine(lbl+"d8", x, r+row*2+4, 305);
+
+   // --- Status ---
+   r = r + row*2 + 12;
+   ObjLabel(lbl+"l_sta",  "Status",    x,  r, lbl_col, lfs);
+   ObjLabel(lbl+"v_sta",  "RUNNING",   vx, r, clrLime,  lfs);
+
+   ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -1402,43 +1491,61 @@ void CreateDashboard()
 //+------------------------------------------------------------------+
 void UpdateDashboard()
 {
-   // Trend
-   double emaHTF[];
-   ArraySetAsSeries(emaHTF, true);
-   if(CopyBuffer(ema_htf_handle, 0, 0, 1, emaHTF) >= 1)
-   {
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(bid > emaHTF[0])
-         ObjSetText(lbl+"v_trend", "BULLISH", clrLime);
-      else
-         ObjSetText(lbl+"v_trend", "BEARISH", clrRed);
-   }
-   
-   // Signal - last pattern
-   string sigStr = "Scanning...";
-   color sigCol = clrGray;
-   int bp = DetectBullishPattern();
-   int sp = DetectBearishPattern();
-   if(bp > 0) { sigStr = "BULL #" + IntegerToString(bp); sigCol = clrLime; }
-   else if(sp > 0) { sigStr = "BEAR #" + IntegerToString(sp); sigCol = clrRed; }
-   ObjSetText(lbl+"v_sig", sigStr, sigCol);
-   
-   // Trades
-   ObjSetText(lbl+"v_buys", IntegerToString(totalBuys) + " (" + DoubleToString(buyProfitPips,1) + "p)", totalBuys > 0 ? clrDodgerBlue : clrGray);
-   ObjSetText(lbl+"v_sells", IntegerToString(totalSells) + " (" + DoubleToString(sellProfitPips,1) + "p)", totalSells > 0 ? clrTomato : clrGray);
-   ObjSetText(lbl+"v_lots", DoubleToString(buyTotalLots + sellTotalLots, 2), clrWhite);
-   
-   // PnL
+   if(!Show_Dashboard) return;
+
+   // HTF trend
+   string trend_str = htf_bullish ? "\x25B2 BULLISH" : (htf_bearish ? "\x25BC BEARISH" : "NEUTRAL");
+   color  trend_col = htf_bullish ? clrLime : (htf_bearish ? clrTomato : clrWhite);
+   ObjSetText(lbl+"v_trend", trend_str, trend_col);
+
+   // CTF
+   string ctf_str = ctf_above_ema ? "Above EMA (BUY zone)" : "Below EMA (SELL zone)";
+   ObjSetText(lbl+"v_ctf", ctf_str, ctf_above_ema ? clrLime : clrTomato);
+
+   // Distance
+   string dist_suffix = (ema_distance_pips >= Min_EMA_Distance) ? " pips OK" : " pips LOW";
+   ObjSetText(lbl+"v_dist", StringFormat("%.1f%s", ema_distance_pips, dist_suffix),
+              (ema_distance_pips >= Min_EMA_Distance) ? clrLime : clrOrange);
+
+   // Signal
+   ObjSetText(lbl+"v_sig", current_signal, signal_color);
+
+   // Live spread
+   double live_spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / pip;
+   color sprd_col = (Max_Spread_Pips > 0 && live_spread > Max_Spread_Pips) ? clrTomato : clrLime;
+   ObjSetText(lbl+"v_sprd", StringFormat("%.1f pips%s", live_spread,
+              (Max_Spread_Pips > 0 && live_spread > Max_Spread_Pips) ? " WIDE!" : " OK"), sprd_col);
+
+   // Open trades
+   ObjSetText(lbl+"v_open", StringFormat("%d (B:%d S:%d)",
+              open_buy_count + open_sell_count, open_buy_count, open_sell_count), clrWhite);
+
+   // Lot size
+   ObjSetText(lbl+"v_lot", StringFormat("%.2f", CalcLotSize()), clrWhite);
+
+   // Floating P&L
+   ObjSetText(lbl+"v_fpnl", StringFormat("%.2f", floating_pnl),
+              floating_pnl >= 0 ? clrLime : clrTomato);
+
+   // Period P&L (cached)
    RefreshPnLCache();
-   ObjSetText(lbl+"v_pnl1", "$"+DoubleToString(pnlToday,2), pnlToday >= 0 ? clrLime : clrRed);
-   ObjSetText(lbl+"v_pnl1b","$"+DoubleToString(pnlYesterday,2), pnlYesterday >= 0 ? clrLime : clrRed);
-   ObjSetText(lbl+"v_pnl2", "$"+DoubleToString(pnlWeek,2), pnlWeek >= 0 ? clrLime : clrRed);
-   ObjSetText(lbl+"v_pnl2b","$"+DoubleToString(pnlMonth,2), pnlMonth >= 0 ? clrLime : clrRed);
-   
-   // AMA status
+   ObjSetText(lbl+"v_today", StringFormat("USD %.2f", pnl_today),  pnl_today  >= 0 ? clrLime : clrTomato);
+   ObjSetText(lbl+"v_yest",  StringFormat("USD %.2f", pnl_yesterday), clrWhite);
+   ObjSetText(lbl+"v_week",  StringFormat("USD %.2f", pnl_week),   pnl_week   >= 0 ? clrLime : clrTomato);
+   ObjSetText(lbl+"v_mo",    StringFormat("USD %.2f", pnl_month),  pnl_month  >= 0 ? clrLime : clrTomato);
+   ObjSetText(lbl+"v_lmo",   StringFormat("USD %.2f", pnl_last_month), clrWhite);
+
+   // News
+   string news_str = News_Filter_Enable ? (news_active ? "ACTIVE!" : "ON") : "OFF";
+   ObjSetText(lbl+"v_news", news_str, news_active ? clrOrange : clrLime);
+
+   // Last bar
+   ObjSetText(lbl+"v_bar", TimeToString(last_bar_time, TIME_DATE|TIME_MINUTES), clrWhite);
+
+   // AMA Exit flip status
    UpdateAMADashboard();
-   
-   // Reversal Detection status
+
+   // Reversal Detection status (NEW)
    if(Use_Reversal_Exit)
    {
       int maxSig = MathMax(reversal_buy_signals, reversal_sell_signals);
@@ -1451,11 +1558,8 @@ void UpdateDashboard()
    }
    else
       ObjSetText(lbl+"v_revst", "DISABLED", clrGray);
-   
-   // Time
-   ObjSetText(lbl+"v_time", TimeToString(TimeCurrent(), TIME_MINUTES), clrWhite);
-   
-   ChartRedraw();
+
+   ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -1463,87 +1567,112 @@ void UpdateDashboard()
 //+------------------------------------------------------------------+
 void UpdateAMADashboard()
 {
-   if(!Use_AMA_Exit)
+   if(!Use_AMA_Exit) { ObjSetText(lbl+"v_amast", "DISABLED", clrGray); return; }
+   if(open_buy_count == 0 && open_sell_count == 0) { ObjSetText(lbl+"v_amast", "No Position", clrGray); return; }
+
+   int need = MathMax(1, AMA_Confirm_Candles);
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(ama_handle, 0, 1, need, buf) < need)
    {
-      ObjSetText(lbl+"v_amast", "OFF", clrGray);
+      ObjSetText(lbl+"v_amast", "---", clrGray);
       return;
    }
-   
-   string amaTxt = "Flips B:" + IntegerToString(amaFlipBuy) + " S:" + IntegerToString(amaFlipSell);
-   ObjSetText(lbl+"v_amast", amaTxt, clrCyan);
+
+   if(open_buy_count > 0)
+   {
+      int count_against = 0;
+      for(int i = 0; i < need; i++)
+      {
+         double close_px = iClose(_Symbol, PERIOD_M1, i + 1);
+         if(close_px < buf[i]) count_against++;
+         else break;
+      }
+      ObjSetText(lbl+"v_amast", StringFormat("BUY %d/%d below", count_against, need),
+                 count_against >= need ? clrTomato : clrYellow);
+   }
+   else if(open_sell_count > 0)
+   {
+      int count_against = 0;
+      for(int i = 0; i < need; i++)
+      {
+         double close_px = iClose(_Symbol, PERIOD_M1, i + 1);
+         if(close_px > buf[i]) count_against++;
+         else break;
+      }
+      ObjSetText(lbl+"v_amast", StringFormat("SELL %d/%d above", count_against, need),
+                 count_against >= need ? clrTomato : clrYellow);
+   }
 }
 
 //+------------------------------------------------------------------+
 //| DASHBOARD HELPER FUNCTIONS                                        |
 //+------------------------------------------------------------------+
-void ObjLabel(string name, string text, int x, int y, color clr, int fontSize)
+void ObjLabel(string name, string text, int x, int y, color clr, int fs=8, bool bold=false)
 {
-   if(ObjectFind(0, name) < 0)
-   {
-      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetString(0, name, OBJPROP_FONT, "Arial");
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   }
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, name, OBJPROP_TEXT, text);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetString(0,  name, OBJPROP_TEXT,      text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  fs);
+   ObjectSetString(0,  name, OBJPROP_FONT,      bold ? "Arial Bold" : "Arial");
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
 }
 
 void ObjSetText(string name, string text, color clr)
 {
-   if(ObjectFind(0, name) >= 0)
-   {
-      ObjectSetString(0, name, OBJPROP_TEXT, text);
-      ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
-   }
+   if(ObjectFind(0, name) < 0) return;
+   ObjectSetString(0,  name, OBJPROP_TEXT,  text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
 }
 
 void ObjLine(string name, int x, int y, int width)
 {
-   string txt = ""; 
-   for(int i = 0; i < width/5; i++) txt += "-";
-   ObjLabel(name, txt, x, y, C'60,70,100', 7);
-}
-
-void ObjRect(string name, int x, int y, int w, int h, color bg, color border)
-{
-   if(ObjectFind(0, name) < 0)
-   {
-      ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   }
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   string dashes = "";
+   int count = (int)(width / 5.5);
+   for(int i = 0; i < count; i++) dashes += "-";
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
-   ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
-   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, border);
+   ObjectSetString(0,  name, OBJPROP_TEXT,      dashes);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     C'45,55,90');
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  6);
+   ObjectSetString(0,  name, OBJPROP_FONT,      "Arial");
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
 }
 
-void DeleteDashboard()
+void ObjRect(string name, int x, int y, int w, int h, color bg, color border, int bwidth)
 {
-   ObjectsDeleteAll(0, lbl);
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     bg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       border);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,       bwidth);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
 }
+
+void DeleteDashboard() { ObjectsDeleteAll(0, lbl); }
 
 string TFStr(ENUM_TIMEFRAMES tf)
 {
    switch(tf)
    {
-      case PERIOD_M1:  return "M1";
-      case PERIOD_M5:  return "M5";
-      case PERIOD_M15: return "M15";
-      case PERIOD_M30: return "M30";
-      case PERIOD_H1:  return "H1";
-      case PERIOD_H4:  return "H4";
-      case PERIOD_D1:  return "D1";
-      case PERIOD_W1:  return "W1";
-      case PERIOD_MN1: return "MN";
-      default:         return EnumToString(tf);
+      case PERIOD_M1:  return "M1";  case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15"; case PERIOD_M30: return "M30";
+      case PERIOD_H1:  return "H1";  case PERIOD_H4:  return "H4";
+      case PERIOD_D1:  return "D1";  case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN";  default:         return "?";
    }
 }
 //+------------------------------------------------------------------+
